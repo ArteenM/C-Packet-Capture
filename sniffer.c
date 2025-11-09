@@ -151,6 +151,7 @@ void get_mac(char *if_name, packet_filter_transfer *filter, char *if_type) { // 
         exit_with_error("Socket creation failed for MAC retrieval");
     }
 
+    ifr.ifr_addr.sa_family = AF_INET;
     strncpy(ifr.ifr_name, if_name, IFNAMSIZ-1);
     ioctl(fd, SIOCGIFHWADDR, &ifr);
     close(fd);
@@ -226,6 +227,17 @@ void process_packet(uint8_t *buffer, int size, packet_filter_transfer *filter, F
     else {
         return; // Unsupported protocol
     }
+
+    log_eth_headers(eth, logfile);
+    log_ip_headers(ip, logfile);
+    if (tcp != NULL) {
+        log_tcp_headers(tcp, logfile);
+    }
+    if (udp != NULL) {
+        log_udp_headers(udp, logfile);
+    }
+
+    log_payload(buffer, size, ip_header_len, ip->protocol, logfile, tcp);
 }
 
 int main(int argc, char **argv) {
