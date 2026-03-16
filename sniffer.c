@@ -50,6 +50,11 @@ typedef struct {
 /* Globals for storing parsed socket addresses (IPv4) */
 struct sockaddr_in source_address, dest_address;
 
+int total_packets = 0;
+int tcp_packets = 0;
+int udp_packets = 0;
+int icmp_packets = 0;
+
 uint8_t filter_port(uint16_t source_port, uint16_t dest_port, packet_filter_transfer *filter) {
     if (filter->source_port != 0 && filter->source_port != source_port) {
         return 0; // Source port does not match
@@ -180,6 +185,23 @@ uint8_t compare_mac(uint8_t *mac1, uint8_t *mac2) {
 void process_packet(uint8_t *buffer, int size, packet_filter_transfer *filter, FILE *logfile) {
     int ip_header_len;
 
+
+    total_packets++;
+
+    switch(ip->protocol)
+    {
+        case 6:
+            tcp_packets++;
+            break;
+
+        case 17:
+            udp_packets++;
+            break;
+
+        case 1:
+            icmp_packets++;
+            break;
+    }
     struct ethhdr *eth = (struct ethhdr *)buffer; // ethernet header
 
     if (ntohs(eth->h_proto) != 0x0800) {
@@ -371,4 +393,9 @@ int main(int argc, char **argv) {
         process_packet(buffer, buffer_len, &filter, logfile);
         fflush(logfile);
         }
+
+    printf("Total packets: %d\n", total_packets);
+    printf("TCP: %d\n", tcp_packets);
+    printf("UDP: %d\n", udp_packets);
+    printf("ICMP: %d\n", icmp_packets);
 }
