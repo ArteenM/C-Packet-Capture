@@ -6,397 +6,312 @@
 #include <string.h>
 
 /* Networking headers */
-#include <netinet/in.h>      /* sockaddr_in, IPPROTO_* */
-#include <arpa/inet.h>      /* inet_ntoa, inet_addr */
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
-/* Linux-specific raw packet capture headers */
+/* Linux raw packet headers */
 #include <sys/ioctl.h>
-#include <linux/if_packet.h> /* AF_PACKET, sockaddr_ll */
-#include <net/if.h>          /* ifreq */
-#include <netinet/if_ether.h> /* Ethernet headers */
-#include <netinet/ip.h>     /* IP header struct */
-#include <netinet/udp.h>    /* UDP header struct */
-#include <netinet/tcp.h>    /* TCP header struct */
+#include <linux/if_packet.h>
+#include <net/if.h>
+#include <netinet/if_ether.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+#include <netinet/tcp.h>
 
 #include <getopt.h>
 #include <errno.h>
-#include <unistd.h>  /* for close() */
+#include <unistd.h>
 
+#define exit_with_error(msg) do { perror(msg); exit(EXIT_FAILURE); } while(0)
 
- // Helper macro to exit with an error
+/* ============================
+   Packet filter configuration
+   ============================ */
 
-#define exit_with_error(msg) do {perror(msg); exit (EXIT_FAILURE);} while(0)
-
-/*
- * packet_filter_transfer
- * A small structure intended to hold filtering/mapping information
- * for captured packets: transfer protocol (IP/UDP/TCP), source/dest
- * IPs and ports, interface names and MAC addresses.
- */
 typedef struct {
-    uint8_t transfer_protocol;   /* e.g. IPPROTO_TCP, IPPROTO_UDP */
-    char * source_ip;            /* textual source IP (optional) */
-    char * dest_ip;              /* textual dest IP (optional) */
-    uint16_t source_port;        /* source port (host order) */
-    uint16_t dest_port;          /* dest port (host order) */
-    char *source_interface_name; /* name of source interface (e.g., "eth0") */
-    char *dest_interface_name;   /* name of dest interface (if used)
-                                   used to map an interface to a MAC */
-    uint8_t source_mac[6];       /* binary MAC address (6 bytes) */
-    uint8_t dest_mac[6];         /* binary dest MAC address */
-
+    uint8_t transfer_protocol;
+    char *source_ip;
+    char *dest_ip;
+    uint16_t source_port;
+    uint16_t dest_port;
+    char *source_interface_name;
+    char *dest_interface_name;
+    uint8_t source_mac[6];
+    uint8_t dest_mac[6];
 } packet_filter_transfer;
 
-/* Globals for storing parsed socket addresses (IPv4) */
 struct sockaddr_in source_address, dest_address;
 
-int total_packets = 0;
-int tcp_packets = 0;
-int udp_packets = 0;
-int icmp_packets = 0;
+/* ============================
+   Traffic analysis structures
+   ============================ */
 
-uint8_t filter_port(uint16_t source_port, uint16_t dest_port, packet_filter_transfer *filter) {
-    if (filter->source_port != 0 && filter->source_port != source_port) {
-        return 0; // Source port does not match
-    }
-    if (filter->dest_port != 0 && filter->dest_port != dest_port) {
-        return 0; // Dest port does not match
-    }
-    return 1;
-}
+#define MAX_IP_TRACK 1000
 
-uint8_t filter_ip(packet_filter_transfer *filter) {
-    if (filter->source_ip != NULL && strcmp(filter->source_ip, inet_ntoa(source_address.sin_addr)) != 0) {
-        return 0; // Source IP does not match
-    }
-    if (filter->dest_ip != NULL && strcmp(filter->dest_ip, inet_ntoa(dest_address.sin_addr)) != 0) {
-        return 0; // Dest IP does not match
-    }
-    return 1;
-}
+typedef struct {
+    char ip[16];
+    int count;
+} ip_counter;
 
-void log_eth_headers(struct ethhdr *eth, FILE *logfile) {
-    fprintf(logfile, "\nEthernet Header\n");
-    fprintf(logfile, "\t-Source MAC: %.2X:%.2X:%.2X:%.2X:%.2X:%.2X\n",
-            eth->h_source[0], eth->h_source[1], eth->h_source[2],
-            eth->h_source[3], eth->h_source[4], eth->h_source[5]);
-    fprintf(logfile, "\t-Destination MAC: %.2X:%.2X:%.2X:%.2X:%.2X:%.2X\n",
-            eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
-            eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
-    fprintf(logfile, "\t-Protocol: %d\n", ntohs(eth->h_proto));
-}
+ip_counter ip_stats[MAX_IP_TRACK];
+int ip_count = 0;
 
-void log_ip_headers(struct iphdr *ip, FILE *lf) {
-    fprintf(lf, "\nIP Header\n");
-    
-    fprintf(lf, "\t-Version : %d\n", (uint32_t)ip->version);
-    fprintf(lf, "\t-Internet Header Length : %d bytes \n", (uint32_t)(ip->ihl * 4));
-    fprintf(lf, "\t-Type of Service : %d\n", (uint32_t)ip->tos);
-    fprintf(lf, "\t-Total Length : %d\n", ntohs(ip->tot_len));
-    fprintf(lf, "\t-Identification : %d\n", (uint32_t)ip->id);
-    fprintf(lf, "\t-Time to Live : %d\n", (uint32_t)ip->ttl);
-    fprintf(lf, "\t-Protocol : %d\n", (uint32_t)ip->protocol);
-    fprintf(lf, "\t-Header Checksum : %d\n", ntohs(ip->check));
-    fprintf(lf, "\t-Source IP : %s\n", inet_ntoa(source_address.sin_addr));
-    fprintf(lf, "\t-Destination : %s\n", inet_ntoa(dest_address.sin_addr));
-}
+/* Packet statistics */
+long total_packets = 0;
+long tcp_packets = 0;
+long udp_packets = 0;
+long syn_packets = 0;
 
-void log_tcp_headers(struct tcphdr *tcp, FILE *lf) {
-    fprintf(lf, "\nTCP Header\n");
-    fprintf(lf, "\t-Source Port : %d\n", ntohs(tcp->source));
-    fprintf(lf, "\t-Destination Port : %u\n", ntohs(tcp->dest));
-    fprintf(lf, "\t-Sequence Number : %u\n", ntohl(tcp->seq));
-    fprintf(lf, "\t-Acknowledgement Number : %d\n", ntohl(tcp->ack_seq));
-    fprintf(lf, "\t-Header Length in Bytes : %d\n", (uint32_t)tcp->doff * 4);
-    fprintf(lf, "\t ------- Flags ---------");
-    fprintf(lf, "\t-Urgent Flag : %d\n", (uint32_t)tcp->urg);
-    fprintf(lf, "\t-Acknowledgement Flag : %d\n", (uint32_t)tcp->ack);
-    fprintf(lf, "\t-Push Flag : %d\n", (uint32_t)tcp->psh);
-    fprintf(lf, "\t-Reset Flag : %d\n", (uint32_t)tcp->rst);
-    fprintf(lf, "\t-Synchronise Flag : %d\n", (uint32_t)tcp->syn);
-    fprintf(lf, "\t-Finish Flag : %d\n", (uint32_t)tcp->fin);
-    fprintf(lf, "\t-Window Size : %d\n", ntohs(tcp->window));
-    fprintf(lf, "\t-Checksum : %d\n", ntohs(tcp->check));
-    fprintf(lf, "\t-Urgent pointer : %d\n", tcp->urg_ptr);
-}
+/* ============================
+   Traffic analysis helpers
+   ============================ */
 
-void log_udp_headers(struct udphdr *udp, FILE *lf) {
-    fprintf(lf, "\nUDP Header\n");
-    fprintf(lf, "\t-Source Port : %d\n", ntohs(udp->source));
-    fprintf(lf, "\t-Destination Port : %u\n", ntohs(udp->dest));
-    fprintf(lf, "\t-UDP Length : %u\n", ntohs(udp->len));
-    fprintf(lf, "\t-UDP Checksum : %u\n", ntohs(udp->check));
-}
-
-void log_payload(uint8_t *buffer, int bufflen, int iphdrlen, uint8_t t_protocol, FILE *lf, struct tcphdr *tcp) {
-    uint32_t t_protocol_header_size = sizeof(struct udphdr);
-    if (t_protocol == IPPROTO_TCP) {
-        t_protocol_header_size = (uint32_t)tcp->doff * 4;
-    }
-    uint8_t *packet_data = (buffer + sizeof(struct ethhdr) + iphdrlen + t_protocol_header_size);
-    int remaining_data_size = bufflen - (sizeof(struct ethhdr) + iphdrlen + t_protocol_header_size);
-
-    fprintf(lf, "\nData\n");
-    for (int i = 0; i < remaining_data_size; i++) {
-        if (i != 0 && i % 16 == 0) {
-            fprintf(lf, "\n");
+void track_ip(char *ip)
+{
+    for(int i=0;i<ip_count;i++)
+    {
+        if(strcmp(ip_stats[i].ip, ip) == 0)
+        {
+            ip_stats[i].count++;
+            return;
         }
-        fprintf(lf, " %2.X ", packet_data[i]);
     }
-    fprintf(lf, "\n");
+
+    if(ip_count < MAX_IP_TRACK)
+    {
+        strcpy(ip_stats[ip_count].ip, ip);
+        ip_stats[ip_count].count = 1;
+        ip_count++;
+    }
 }
 
+void print_statistics()
+{
+    printf("\n===== Traffic Statistics =====\n");
+    printf("Total Packets: %ld\n", total_packets);
+    printf("TCP Packets: %ld\n", tcp_packets);
+    printf("UDP Packets: %ld\n", udp_packets);
+    printf("SYN Packets: %ld\n", syn_packets);
 
-void get_mac(char *if_name, packet_filter_transfer *filter, char *if_type) { // Takes interface name and type (source/dest)
+    printf("\nTop Talkers:\n");
+
+    for(int i=0;i<ip_count && i<10;i++)
+    {
+        printf("%s : %d packets\n", ip_stats[i].ip, ip_stats[i].count);
+    }
+
+    if(syn_packets > 1000)
+    {
+        printf("\n[WARNING] Possible SYN Flood Detected\n");
+    }
+}
+
+/* ============================
+   Filtering
+   ============================ */
+
+uint8_t filter_port(uint16_t source_port, uint16_t dest_port, packet_filter_transfer *filter)
+{
+    if (filter->source_port != 0 && filter->source_port != source_port)
+        return 0;
+
+    if (filter->dest_port != 0 && filter->dest_port != dest_port)
+        return 0;
+
+    return 1;
+}
+
+uint8_t filter_ip(packet_filter_transfer *filter)
+{
+    if (filter->source_ip != NULL &&
+        strcmp(filter->source_ip, inet_ntoa(source_address.sin_addr)) != 0)
+        return 0;
+
+    if (filter->dest_ip != NULL &&
+        strcmp(filter->dest_ip, inet_ntoa(dest_address.sin_addr)) != 0)
+        return 0;
+
+    return 1;
+}
+
+/* ============================
+   Logging helpers
+   ============================ */
+
+void log_eth_headers(struct ethhdr *eth, FILE *logfile)
+{
+    fprintf(logfile,"\nEthernet Header\n");
+
+    fprintf(logfile,"Source MAC: %.2X:%.2X:%.2X:%.2X:%.2X:%.2X\n",
+            eth->h_source[0],eth->h_source[1],eth->h_source[2],
+            eth->h_source[3],eth->h_source[4],eth->h_source[5]);
+
+    fprintf(logfile,"Destination MAC: %.2X:%.2X:%.2X:%.2X:%.2X:%.2X\n",
+            eth->h_dest[0],eth->h_dest[1],eth->h_dest[2],
+            eth->h_dest[3],eth->h_dest[4],eth->h_dest[5]);
+}
+
+void log_ip_headers(struct iphdr *ip, FILE *lf)
+{
+    fprintf(lf,"\nIP Header\n");
+    fprintf(lf,"Source IP: %s\n", inet_ntoa(source_address.sin_addr));
+    fprintf(lf,"Destination IP: %s\n", inet_ntoa(dest_address.sin_addr));
+    fprintf(lf,"Protocol: %d\n", ip->protocol);
+}
+
+void log_tcp_headers(struct tcphdr *tcp, FILE *lf)
+{
+    fprintf(lf,"\nTCP Header\n");
+    fprintf(lf,"Source Port: %d\n", ntohs(tcp->source));
+    fprintf(lf,"Destination Port: %d\n", ntohs(tcp->dest));
+
+    if(tcp->syn && !tcp->ack)
+        syn_packets++;
+}
+
+void log_udp_headers(struct udphdr *udp, FILE *lf)
+{
+    fprintf(lf,"\nUDP Header\n");
+    fprintf(lf,"Source Port: %d\n", ntohs(udp->source));
+    fprintf(lf,"Destination Port: %d\n", ntohs(udp->dest));
+}
+
+/* ============================
+   MAC utilities
+   ============================ */
+
+void get_mac(char *if_name, packet_filter_transfer *filter, char *if_type)
+{
     int fd;
     struct ifreq ifr;
 
     fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd == -1) {
-        exit_with_error("Socket creation failed for MAC retrieval");
-    }
+    if(fd == -1)
+        exit_with_error("Socket creation failed");
 
-    ifr.ifr_addr.sa_family = AF_INET;
     strncpy(ifr.ifr_name, if_name, IFNAMSIZ-1);
-    ioctl(fd, SIOCGIFHWADDR, &ifr);
+
+    if(ioctl(fd, SIOCGIFHWADDR, &ifr) == -1)
+        exit_with_error("MAC retrieval failed");
+
     close(fd);
 
-    if (strcmp(if_type, "source") == 0) {
-        strcpy(filter->source_mac, (uint8_t *)ifr.ifr_hwaddr.sa_data);
-    }
-    else {
-        strcpy(filter->dest_mac, (uint8_t *)ifr.ifr_hwaddr.sa_data);
-    }
-
-    memcpy(filter->source_mac, ifr.ifr_hwaddr.sa_data, 6);
+    if(strcmp(if_type,"source")==0)
+        memcpy(filter->source_mac, ifr.ifr_hwaddr.sa_data,6);
+    else
+        memcpy(filter->dest_mac, ifr.ifr_hwaddr.sa_data,6);
 }
 
-// Utility Function to Compare Mac Addresses (first 6 bits)
+uint8_t compare_mac(uint8_t *mac1, uint8_t *mac2)
+{
+    for(int i=0;i<6;i++)
+        if(mac1[i]!=mac2[i])
+            return 0;
 
-uint8_t compare_mac(uint8_t *mac1, uint8_t *mac2) {
-    for (uint8_t i = 0; i < 6; i++) {
-        if (mac1[i] != mac2[i]) {
-            return 0; // Not equal
-        }
-    }
-    return 1; // Equal
+    return 1;
 }
 
-void process_packet(uint8_t *buffer, int size, packet_filter_transfer *filter, FILE *logfile) {
-    int ip_header_len;
+/* ============================
+   Packet processing
+   ============================ */
 
+void process_packet(uint8_t *buffer,int size,packet_filter_transfer *filter,FILE *logfile)
+{
+    struct ethhdr *eth = (struct ethhdr*)buffer;
 
-    struct ethhdr *eth = (struct ethhdr *)buffer; // ethernet header
+    if(ntohs(eth->h_proto)!=0x0800)
+        return;
 
-    if (ntohs(eth->h_proto) != 0x0800) {
-        return; // Not an IP packet
-    }
+    struct iphdr *ip=(struct iphdr*)(buffer+sizeof(struct ethhdr));
 
-    if (filter->source_interface_name != NULL && compare_mac(filter->source_mac, eth->h_source) == 0) {
-        return; // Source MAC does not match
-    }
+    int ip_header_len = ip->ihl*4;
 
-    if (filter->dest_interface_name != NULL && compare_mac(filter->dest_mac, eth->h_dest) == 0) {
-        return; // Dest MAC does not match
-    }
+    source_address.sin_addr.s_addr=ip->saddr;
+    dest_address.sin_addr.s_addr=ip->daddr;
 
-    struct iphdr *ip = (struct iphdr *)(buffer + sizeof(struct ethhdr)); // IP header
-    ip_header_len = ip->ihl * 4;
+    if(!filter_ip(filter))
+        return;
 
-    memset(&source_address, 0, sizeof(source_address));
-    memset(&dest_address, 0, sizeof(dest_address));
-    source_address.sin_addr.s_addr = ip->saddr;
-    dest_address.sin_addr.s_addr = ip->daddr;
+    char *src = inet_ntoa(source_address.sin_addr);
+    track_ip(src);
 
-     total_packets++;
+    total_packets++;
 
-    switch(ip->protocol)
+    struct tcphdr *tcp=NULL;
+    struct udphdr *udp=NULL;
+
+    if(ip->protocol==IPPROTO_TCP)
     {
-        case 6:
-            tcp_packets++;
-            break;
+        tcp_packets++;
 
-        case 17:
-            udp_packets++;
-            break;
+        tcp=(struct tcphdr*)(buffer+sizeof(struct ethhdr)+ip_header_len);
 
-        case 1:
-            icmp_packets++;
-            break;
-    }
+        if(!filter_port(ntohs(tcp->source),ntohs(tcp->dest),filter))
+            return;
 
-    if(filter_ip(filter) == 0){
-        return; // IP filter does not match
+        log_eth_headers(eth,logfile);
+        log_ip_headers(ip,logfile);
+        log_tcp_headers(tcp,logfile);
     }
 
-    if (filter->transfer_protocol != 0 && ip->protocol != filter->transfer_protocol) {
-        return; // Protocol does not match
-    }
+    else if(ip->protocol==IPPROTO_UDP)
+    {
+        udp_packets++;
 
-    struct tcphdr *tcp = NULL;
-    struct udphdr *udp = NULL;
-    if(ip->protocol == IPPROTO_TCP) {
-        tcp = (struct tcphdr *)(buffer + sizeof(struct ethhdr) + ip_header_len);
-        if (filter_port(ntohs(tcp->source), ntohs(tcp->dest), filter) == 0) {
-            return; // Port filter does not match
-        }
-    }
-    else if(ip->protocol == IPPROTO_UDP) {
-        udp = (struct udphdr *)(buffer + sizeof(struct ethhdr) + ip_header_len);
-        if (filter_port(ntohs(udp->source), ntohs(udp->dest), filter) == 0) {
-            return; // Port filter does not match
-        }
-    }
-    else {
-        return; // Unsupported protocol
-    }
+        udp=(struct udphdr*)(buffer+sizeof(struct ethhdr)+ip_header_len);
 
-    log_eth_headers(eth, logfile);
-    log_ip_headers(ip, logfile);
-    if (tcp != NULL) {
-        log_tcp_headers(tcp, logfile);
-    }
-    if (udp != NULL) {
-        log_udp_headers(udp, logfile);
-    }
+        if(!filter_port(ntohs(udp->source),ntohs(udp->dest),filter))
+            return;
 
-    log_payload(buffer, size, ip_header_len, ip->protocol, logfile, tcp);
+        log_eth_headers(eth,logfile);
+        log_ip_headers(ip,logfile);
+        log_udp_headers(udp,logfile);
+    }
 }
 
-int main(int argc, char **argv) {
-    /*
-     * Local variables used for option parsing and logging.
-     * - c: for getopt
-     * - log: small buffer for log messages
-     * - logfile: optional FILE pointer if logging to a file
-     */
-    int c;
-    char log[225];
-    FILE *logfile = NULL;
+/* ============================
+   Main
+   ============================ */
 
-    /* Initialize filter structure with zero/NULL defaults */
-    packet_filter_transfer filter = {0, NULL, NULL, 0, 0, NULL, NULL};
-    
-    /* Generic socket address used later when receiving packets */
+int main(int argc,char **argv)
+{
+    int sockfd;
+    int buffer_len;
+
     struct sockaddr socket_address;
+    socklen_t socket_len = sizeof(socket_address);
 
-    /* Socket/file descriptors and length variables */
-    int sockfd, source_address_len, buffer_len;
+    uint8_t *buffer = malloc(65536);
 
-    /*
-     * Allocate a large buffer to hold raw packet data. 65536 bytes is
-     * a common choice to ensure a full packet (including headers) fits.
-     */
-    uint8_t *buffer = (uint8_t *) malloc(65536);
+    if(!buffer)
+        exit_with_error("malloc");
 
-    /* Zero the buffer before use */
-    memset(buffer, 0, 65536);
+    packet_filter_transfer filter = {0,NULL,NULL,0,0,NULL,NULL,{0},{0}};
 
-    /*
-     * Create a raw packet socket bound to the device at the link layer.
-     * AF_PACKET + SOCK_RAW allows receiving raw Ethernet frames. ETH_P_ALL
-     * means we want packets for all Ethernet protocols (IP, ARP, etc.).
-     */
-    sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (sockfd < 0) {
-        exit_with_error("Failed to create raw socket");
-    }
+    sockfd = socket(AF_PACKET,SOCK_RAW,htons(ETH_P_ALL));
 
-    while (1) {
-        static struct option long_options[] = {
-            {"sip", required_argument, NULL, 's'}, // Source IP
-            {"dip", required_argument, NULL, 'd'}, // Destination IP
-            {"sport", required_argument, NULL, 'p'}, // Source port
-            {"dport", required_argument, NULL, 'o'}, // Destination port
-            {"sif", required_argument, NULL, 'i'}, // Source interface
-            {"dif", required_argument, NULL, 'g'}, // Destination interface
-            {"logfile", required_argument, NULL, 'f'}, // Log file
-            {"tcp", no_argument, NULL, 't'}, // TCP protocol
-            {"udp", no_argument, NULL, 'u'}, // UDP protocol
-            {0, 0, 0, 0} // End of options
-        };
+    if(sockfd<0)
+        exit_with_error("Raw socket failed");
 
-        c = getopt_long(argc, argv, "tus:d:p:o:i:g:f:", long_options, NULL);
+    FILE *logfile = fopen("traffic.log","w");
 
-        if (c== -1) {
-            break; // No more options
-        }
+    if(!logfile)
+        exit_with_error("logfile");
 
-        switch (c) {
-            case 's':
-                filter.source_ip = optarg;
-                break;
-            case 'd':
-                filter.dest_ip = optarg;
-                break;
-            case 'p':
-                filter.source_port = atoi(optarg);
-                break;
-            case 'o':
-                filter.dest_port = atoi(optarg);
-                break;
-            case 'i':
-                filter.source_interface_name = optarg;
-                break;
-            case 'g':
-                filter.dest_interface_name = optarg;
-                break;
-            case 'f':
-                strcpy(log, optarg);
-                break;
-            case 't':
-                filter.transfer_protocol = IPPROTO_TCP;
-                break;
-            case 'u':
-                filter.transfer_protocol = IPPROTO_UDP;
-                break;
-            default:
-                abort();
-        }
-    }
+    printf("Sniffer running...\n");
 
-    printf("t_protocol: %d\n", filter.transfer_protocol);
-    printf("source_port %d\n", filter.source_port);
-    printf("dest_port %d\n", filter.dest_port);
-    printf("source_ip: %s\n", filter.source_ip);
-    printf("dest_ip: %s\n", filter.dest_ip);
-    printf("source interface %s\n", filter.source_interface_name);
-    printf("dest interface %s\n", filter.dest_interface_name);
-    printf("log file %s\n", log);
-
-    if (strlen(log) == 0)
+    while(1)
     {
-        strcpy(log, "sniffer.txt");
-    }
-    logfile = fopen(log, "w");
+        buffer_len = recvfrom(sockfd,buffer,65536,0,&socket_address,&socket_len);
 
-    if (logfile == NULL) {
-        exit_with_error("Failed to open log file");
-    }
+        if(buffer_len < 0)
+            exit_with_error("recvfrom");
 
-    if (filter.source_interface_name != NULL) {
-        get_mac(filter.source_interface_name, &filter, "source");
-    }
+        process_packet(buffer,buffer_len,&filter,logfile);
 
-    if (filter.dest_interface_name != NULL) {
-        get_mac(filter.dest_interface_name, &filter, "dest");
+        if(total_packets % 5000 == 0)
+            print_statistics();
     }
 
-    while (1) {
-        source_address_len = sizeof(source_address);
-        buffer_len = recvfrom(sockfd, buffer, 65536, 0,
-                              &socket_address, (socklen_t *)&source_address_len);
-
-        if (buffer_len < 0) {
-            exit_with_error("Failed to receive packets");
-        }
-
-        process_packet(buffer, buffer_len, &filter, logfile);
-        fflush(logfile);
-        }
-
-    printf("Total packets: %d\n", total_packets);
-    printf("TCP: %d\n", tcp_packets);
-    printf("UDP: %d\n", udp_packets);
-    printf("ICMP: %d\n", icmp_packets);
+    close(sockfd);
 }
